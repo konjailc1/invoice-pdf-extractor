@@ -1,25 +1,35 @@
-"""Read a supplier invoice PDF and return its header fields and line items.
+"""Read one Vietnamese VAT invoice PDF.
 
-The sample PDFs use three layouts with different labels (see make_samples.py).
-Header fields are found with regular expressions. The line-item grid is found
-with pdfplumber's table reader.
+The sample layout (see make_samples.py) follows the usual VAT invoice order:
+seller block, red title, buyer block, items table, totals, amount in words.
 
-Returned dictionary:
+Header fields are found with regular expressions. The items grid is read with
+pdfplumber. Money uses a dot as the thousands separator (1.000.000).
+
+Returned dictionary (missing values are None):
 
     {
-        "file_name": "01_minh_phat.pdf",
-        "invoice_number": "HD-2026-0142",
+        "file_name": "01_sen_vang.pdf",
+        "form_number": "01GTKT0/001",
+        "serial": "AA/26E",
+        "invoice_number": "0000101",
         "issue_date": "12/01/2026",
-        "seller_name": "Công ty TNHH Thương mại Minh Phát",
-        "tax_code": "0314567890",      # None when the PDF has no tax code
-        "buyer_name": "Công ty TNHH Giải pháp Số Horizon",
-        "subtotal": 6645000,
+        "seller_name": "CÔNG TY TNHH THƯƠNG MẠI SEN VÀNG",
+        "seller_tax_code": "0112345601",
+        "seller_address": "45 Nguyễn Văn Cừ, Phường Bồ Đề, TP. Hà Nội",
+        "buyer_person": "Phạm Thu Trang",
+        "buyer_unit": "Công ty TNHH Giải pháp Số Bình Minh",
+        "buyer_tax_code": "0101112201",
+        "buyer_address": "...",
+        "payment_method": "CK",
+        "subtotal": 3060000,
         "vat_rate": 10,
-        "vat_amount": 664500,
-        "total": 7309500,
+        "vat_amount": 306000,
+        "total": 3366000,
+        "amount_in_words": "Ba triệu ...",
         "line_items": [
-            {"description": "Giấy in A4 Double A 70gsm", "qty": 10,
-             "unit_price": 285000, "amount": 2850000},
+            {"line_no": 1, "description": "Giấy in A4 70gsm", "unit": "ram",
+             "qty": 20, "unit_price": 65000, "amount": 1300000},
         ],
     }
 """
@@ -29,93 +39,93 @@ from pathlib import Path
 
 import pdfplumber
 
-# Each pattern accepts the wording used by the classic, modern, and compact layouts.
-INVOICE_NUMBER_PATTERN = re.compile(
-    r"(?:Số\s+hóa\s+đơn|Invoice\s+No\.?|Mã\s+HĐ|Mã\s+hóa\s+đơn)\s*:\s*(\S+)",
+TITLE = "HÓA ĐƠN GIÁ TRỊ GIA TĂNG"
+
+FORM_PATTERN = re.compile(r"Mẫu số\s*:\s*(\S+)", re.IGNORECASE)
+SERIAL_PATTERN = re.compile(r"Ký hiệu\s*:\s*(\S+)", re.IGNORECASE)
+# "Mẫu số" also contains "số", so require the value to be a long digit string.
+NUMBER_PATTERN = re.compile(r"(?<!Mẫu )Số\s*:\s*(\d{6,8})")
+DATE_PATTERN = re.compile(
+    r"Ngày\s+(\d{1,2})\s+tháng\s+(\d{1,2})\s+năm\s+(\d{4})",
     re.IGNORECASE,
 )
-ISSUE_DATE_PATTERN = re.compile(
-    r"(?:Ngày\s+lập|Ngày|Date)\s*:\s*"
-    r"(\d{1,2}[./-]\d{1,2}[./-]\d{4}|\d{4}[./-]\d{1,2}[./-]\d{1,2})",
-    re.IGNORECASE,
-)
-SELLER_PATTERN = re.compile(
-    r"(?:Người\s+bán|Bên\s+bán|Đơn\s+vị\s+bán)\s*:\s*(.+)",
-    re.IGNORECASE,
-)
-BUYER_PATTERN = re.compile(
-    r"(?:Người\s+mua|Bên\s+mua|Khách\s+hàng)\s*:\s*(.+)",
-    re.IGNORECASE,
-)
-TAX_CODE_PATTERN = re.compile(
-    r"(?:Mã\s+số\s+thuế|MST)\s*:\s*([0-9][0-9\-]*)",
+# The monogram can sit on the same line as the company name, so this is not anchored.
+SELLER_PATTERN = re.compile(r"(CÔNG TY[^\n]+|DOANH NGHIỆP[^\n]+|HỘ KINH DOANH[^\n]+)")
+TAX_PATTERN = re.compile(r"Mã số thuế\s*:\s*([0-9][0-9 \-]*)", re.IGNORECASE)
+ADDRESS_PATTERN = re.compile(r"Địa chỉ\s*:\s*(.+)", re.IGNORECASE)
+BUYER_PERSON_PATTERN = re.compile(r"Họ và tên người mua hàng\s*:\s*(.+)", re.IGNORECASE)
+BUYER_UNIT_PATTERN = re.compile(r"Tên đơn vị\s*:\s*(.+)", re.IGNORECASE)
+PAYMENT_PATTERN = re.compile(
+    r"Hình thức thanh toán\s*:\s*(TM/CK|TM|CK)",
     re.IGNORECASE,
 )
 SUBTOTAL_PATTERN = re.compile(
-    r"(?:Cộng\s+tiền\s+hàng|Tạm\s+tính|Tiền\s+hàng)\s*:\s*([\d\.,]+)\s*(?:VND)?",
+    r"Cộng tiền hàng hóa,\s*dịch vụ\s*:\s*([\d.]+)",
     re.IGNORECASE,
 )
-VAT_PATTERN = re.compile(
-    r"(?:Thuế\s+GTGT|VAT|GTGT)\s*\(?\s*(\d+)\s*%\)?\s*:\s*([\d\.,]+)\s*(?:VND)?",
-    re.IGNORECASE,
-)
-TOTAL_PATTERN = re.compile(
-    r"(?:Tổng\s+cộng\s+thanh\s+toán|Tổng\s+tiền|Số\s+tiền\s+phải\s+trả)"
-    r"\s*:\s*([\d\.,]+)\s*(?:VND)?",
-    re.IGNORECASE,
-)
+VAT_RATE_PATTERN = re.compile(r"Thuế suất GTGT\s*:\s*(\d+)\s*%", re.IGNORECASE)
+VAT_AMOUNT_PATTERN = re.compile(r"Tiền thuế GTGT\s*:\s*([\d.]+)", re.IGNORECASE)
+TOTAL_PATTERN = re.compile(r"Tổng tiền thanh toán\s*:\s*([\d.]+)", re.IGNORECASE)
+WORDS_PATTERN = re.compile(r"Số tiền bằng chữ\s*:\s*(.+)", re.IGNORECASE)
 
-# Header cells we know how to map onto description / qty / unit price / amount.
-DESCRIPTION_KEYS = ("mô tả", "hàng hóa", "mặt hàng", "diễn giải")
-QTY_KEYS = ("số lượng", "qty", "sl")
+DESCRIPTION_KEYS = ("tên hàng", "hàng hóa")
+UNIT_KEYS = ("đvt", "đơn vị tính")
+QTY_KEYS = ("số lượng",)
 UNIT_PRICE_KEYS = ("đơn giá",)
 AMOUNT_KEYS = ("thành tiền",)
 
 
 def extract_invoice(pdf_path):
-    """Extract one invoice. ``pdf_path`` may be a string or a Path.
-
-    Raises the underlying pdfplumber error if the file cannot be opened.
-    Missing fields are returned as None, and missing tables as an empty list,
-    so the validator can report them instead of the program crashing.
-    """
+    """Extract one invoice. ``pdf_path`` may be a string or a Path."""
     path = Path(pdf_path)
     with pdfplumber.open(path) as pdf:
-        text_parts = []
-        line_items = []
+        pages = [page.extract_text() or "" for page in pdf.pages]
+        items = []
         for page in pdf.pages:
-            text_parts.append(page.extract_text() or "")
-            line_items.extend(extract_line_items(page))
+            items.extend(extract_line_items(page))
 
-    header = extract_header("\n".join(text_parts))
+    header = extract_header("\n".join(pages))
     header["file_name"] = path.name
-    header["line_items"] = line_items
+    header["line_items"] = items
     return header
 
 
 def extract_header(text):
-    """Pull invoice number, parties, tax code, and totals out of page text."""
+    """Pull the form fields, parties, totals, and amount in words from page text."""
     cleaned = prepare_text(text)
-    vat_match = VAT_PATTERN.search(cleaned)
+    head, _, tail = cleaned.partition(TITLE)
+    # Fields drawn beside the title can land on either side of the split.
+    whole = cleaned
+
+    date_match = DATE_PATTERN.search(whole)
+    issue_date = None
+    if date_match:
+        day, month, year = (int(part) for part in date_match.groups())
+        issue_date = f"{day:02d}/{month:02d}/{year}"
+
     return {
-        "invoice_number": match_group(INVOICE_NUMBER_PATTERN, cleaned),
-        "issue_date": match_group(ISSUE_DATE_PATTERN, cleaned),
-        "seller_name": match_group(SELLER_PATTERN, cleaned),
-        "tax_code": match_group(TAX_CODE_PATTERN, cleaned),
-        "buyer_name": match_group(BUYER_PATTERN, cleaned),
-        "subtotal": parse_number(match_group(SUBTOTAL_PATTERN, cleaned)),
-        "vat_rate": int(vat_match.group(1)) if vat_match else None,
-        "vat_amount": parse_number(vat_match.group(2)) if vat_match else None,
-        "total": parse_number(match_group(TOTAL_PATTERN, cleaned)),
+        "form_number": match_group(FORM_PATTERN, whole),
+        "serial": match_group(SERIAL_PATTERN, whole),
+        "invoice_number": match_group(NUMBER_PATTERN, whole),
+        "issue_date": issue_date,
+        "seller_name": match_group(SELLER_PATTERN, head),
+        "seller_tax_code": clean_tax_code(match_group(TAX_PATTERN, head)),
+        "seller_address": match_group(ADDRESS_PATTERN, head),
+        "buyer_person": match_group(BUYER_PERSON_PATTERN, tail),
+        "buyer_unit": match_group(BUYER_UNIT_PATTERN, tail),
+        "buyer_tax_code": buyer_tax_code(tail),
+        "buyer_address": match_group(ADDRESS_PATTERN, tail),
+        "payment_method": match_group(PAYMENT_PATTERN, tail),
+        "subtotal": parse_number(match_group(SUBTOTAL_PATTERN, whole)),
+        "vat_rate": _int_or_none(match_group(VAT_RATE_PATTERN, whole)),
+        "vat_amount": parse_number(match_group(VAT_AMOUNT_PATTERN, whole)),
+        "total": parse_number(match_group(TOTAL_PATTERN, whole)),
+        "amount_in_words": clean_words(match_group(WORDS_PATTERN, whole)),
     }
 
 
 def extract_line_items(page):
-    """Return the line items from the first real items table on this page.
-
-    A title banner or a totals bar is ignored. A table counts only when its
-    header row has a description column and an amount column.
-    """
+    """Return line items from the goods table. The 1..6 index row is skipped."""
     table = find_items_table(page)
     if table is None:
         return []
@@ -123,33 +133,67 @@ def extract_line_items(page):
 
 
 def prepare_text(text):
-    """Make small punctuation differences so the patterns can stay simple."""
+    """Normalize spaces and the colon character so the patterns stay simple."""
     text = text.replace("\u00a0", " ").replace("：", ":")
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     return text
 
 
-def match_group(pattern, text, group=1):
-    """Return a stripped capture, or None when the pattern is not in the text."""
+def match_group(pattern, text):
+    """Return a stripped capture, or None when the pattern is absent."""
     match = pattern.search(text)
     if not match:
         return None
-    value = match.group(group).strip()
+    value = match.group(1).strip()
+    return value or None
+
+
+def buyer_tax_code(tail):
+    """The buyer's MST sits on the payment-method line, not in the seller block."""
+    match = re.search(
+        r"Hình thức thanh toán\s*:\s*(?:TM/CK|TM|CK)\s+Mã số thuế\s*:\s*([0-9][0-9 \-]*)",
+        tail,
+        re.IGNORECASE,
+    )
+    if match:
+        return clean_tax_code(match.group(1))
+    # Fall back to a MST that appears after the buyer heading.
+    return clean_tax_code(match_group(TAX_PATTERN, tail))
+
+
+def clean_tax_code(value):
+    """Turn a letter-spaced code like '0 1 1 2 3 4 5 6 0 1' into 0112345601.
+
+    A branch code keeps its hyphen: 0112345610-001.
+    """
+    if not value:
+        return None
+    compact = re.sub(r"\s+", "", value)
+    compact = compact.strip(".:-")
+    if not compact or not re.search(r"\d", compact):
+        return None
+    return compact
+
+
+def clean_words(value):
+    """Collapse a wrapped amount-in-words line into one sentence."""
+    if not value:
+        return None
+    # Stop if the next section header was pulled onto this capture.
+    value = re.split(r"\bNgười mua hàng\b|\bNgười bán hàng\b|\bHóa đơn mẫu\b", value)[0]
+    value = re.sub(r"\s+", " ", value).strip(" .")
     return value or None
 
 
 def parse_number(value):
-    """Turn '1.250.000' or '5.000' into an int. Return None if it is not a number.
+    """Turn '1.250.000' or '2.000' into an int. Return None if it is not a number.
 
-    Dots are thousands separators, which is the Vietnamese way of writing VND.
-    A plain integer such as '20' is left as 20.
+    Dots are thousands separators. A plain integer such as '20' stays 20.
     """
     if value is None:
         return None
-    text = str(value).strip()
-    text = text.replace("\u00a0", "").replace(" ", "")
-    text = text.replace("VND", "").replace("₫", "").replace("đ", "")
-    text = text.strip(".,")
+    text = str(value).strip().replace("\u00a0", "").replace(" ", "")
+    text = text.replace("VND", "").replace("₫", "").replace("đ", "").strip(".,")
     if not text:
         return None
     if re.fullmatch(r"\d{1,3}(\.\d{3})+", text):
@@ -161,36 +205,29 @@ def parse_number(value):
     return None
 
 
+def _int_or_none(value):
+    if value is None:
+        return None
+    return int(value)
+
+
 def find_items_table(page):
-    """Try line detection first, then a text-based fallback."""
-    tables = page.extract_tables() or []
-    found = first_items_table(tables)
+    """Try the default line finder, then a slightly looser one."""
+    found = first_items_table(page.extract_tables() or [])
     if found is not None:
         return found
-
-    # Some PDFs draw rules that sit a fraction off the cell border.
-    loose_lines = {
+    loose = {
         "vertical_strategy": "lines",
         "horizontal_strategy": "lines",
         "snap_tolerance": 5,
         "join_tolerance": 5,
         "intersection_tolerance": 8,
     }
-    tables = page.extract_tables(loose_lines) or []
-    found = first_items_table(tables)
-    if found is not None:
-        return found
-
-    by_text = {
-        "vertical_strategy": "text",
-        "horizontal_strategy": "text",
-        "snap_tolerance": 4,
-    }
-    return first_items_table(page.extract_tables(by_text) or [])
+    return first_items_table(page.extract_tables(loose) or [])
 
 
 def first_items_table(tables):
-    """Return the first table that looks like a line-item grid."""
+    """Return the first table whose header names the goods column and the amount."""
     for table in tables:
         if locate_header(table) is not None and column_map(table) is not None:
             return table
@@ -198,7 +235,7 @@ def first_items_table(tables):
 
 
 def table_to_items(table):
-    """Convert a pdfplumber table into a list of item dictionaries."""
+    """Convert the goods table into item dicts. Skip the header and the 1..6 row."""
     header_index = locate_header(table)
     columns = column_map(table)
     if header_index is None or columns is None:
@@ -206,14 +243,17 @@ def table_to_items(table):
 
     items = []
     for row in table[header_index + 1 :]:
+        if is_index_row(row) or is_header_row(row):
+            continue
         description = clean_cell(row, columns["description"])
-        if not description or is_header_text(description):
+        if not description:
             continue
-        if description.lower().startswith(("cộng", "tổng", "tạm tính", "total")):
-            continue
+        line_no = parse_number(clean_cell(row, columns.get("stt")))
         items.append(
             {
+                "line_no": line_no if line_no is not None else len(items) + 1,
                 "description": description,
+                "unit": clean_cell(row, columns.get("unit")),
                 "qty": parse_number(clean_cell(row, columns["qty"])),
                 "unit_price": parse_number(clean_cell(row, columns["unit_price"])),
                 "amount": parse_number(clean_cell(row, columns["amount"])),
@@ -223,24 +263,27 @@ def table_to_items(table):
 
 
 def column_map(table):
-    """Map the columns we need. Return None if any of them is missing."""
+    """Map description, unit, qty, unit price, and amount. Unit may be absent."""
     header_index = locate_header(table)
     if header_index is None:
         return None
     header = [_normalize(cell).lower() for cell in table[header_index]]
     mapping = {
+        "stt": find_column(header, ("stt",)),
         "description": find_column(header, DESCRIPTION_KEYS),
+        "unit": find_column(header, UNIT_KEYS),
         "qty": find_column(header, QTY_KEYS),
         "unit_price": find_column(header, UNIT_PRICE_KEYS),
         "amount": find_column(header, AMOUNT_KEYS),
     }
-    if any(index is None for index in mapping.values()):
+    required = ("description", "qty", "unit_price", "amount")
+    if any(mapping[name] is None for name in required):
         return None
     return mapping
 
 
 def locate_header(table):
-    """Find the header row. It is almost always row 0, but we check the first three."""
+    """Find the header row. It is almost always row 0."""
     if not table:
         return None
     for index, row in enumerate(table[:3]):
@@ -254,11 +297,7 @@ def locate_header(table):
 
 
 def find_column(names, keys):
-    """Return the index of the header cell that matches one of ``keys``.
-
-    Short keys such as 'sl' must match the whole cell (or the start of it).
-    Longer keys may match inside a header like 'Đơn giá (VND)'.
-    """
+    """Return the header index that matches one of ``keys``."""
     for key in keys:
         for index, name in enumerate(names):
             if name == key or name.startswith(key + " ") or name.startswith(key + "("):
@@ -268,21 +307,28 @@ def find_column(names, keys):
     return None
 
 
+def is_index_row(row):
+    """True for the column-index row '1 2 3 4 5 6=4x5'."""
+    cells = [_normalize(cell) for cell in row]
+    if "6=4x5" in cells or "6=4×5" in cells:
+        return True
+    return cells[:3] == ["1", "2", "3"]
+
+
+def is_header_row(row):
+    """True when a later row repeats the column titles."""
+    names = [_normalize(cell).lower() for cell in row]
+    return find_column(names, DESCRIPTION_KEYS) is not None and find_column(names, AMOUNT_KEYS) is not None
+
+
 def clean_cell(row, index):
-    """Cell text with internal line breaks turned into single spaces."""
+    """Cell text with line breaks turned into spaces."""
     if index is None or index >= len(row):
         return ""
     return _normalize(row[index])
 
 
-def is_header_text(description):
-    """True when a body row is really a repeated header."""
-    lowered = description.lower()
-    return any(key in lowered for key in DESCRIPTION_KEYS) and "thành tiền" in lowered
-
-
 def _normalize(value):
-    """Trim a cell and collapse whitespace. None becomes an empty string."""
     if value is None:
         return ""
     return re.sub(r"\s+", " ", str(value)).strip()

@@ -6,9 +6,9 @@ Usage:
     python main.py sample_input -o output/invoices.xlsx
 
 The workbook has three sheets:
-- Invoices: one row per file, with status OK or ERROR
+- Invoices: one row per file, with status OK or LỖI / ERROR
 - Line Items: one row per item
-- Issues: one row per problem found by the validator
+- Issues: one row per problem, in Vietnamese and English
 
 ERROR rows on the Invoices sheet are filled red. Money columns use the
 Excel format #,##0.
@@ -28,34 +28,51 @@ from validator import validate_invoice
 
 INVOICE_COLUMNS = [
     "File",
-    "Invoice number",
-    "Issue date",
-    "Seller",
-    "Tax code",
-    "Buyer",
-    "Subtotal (VND)",
-    "VAT rate",
-    "VAT amount (VND)",
-    "Total (VND)",
-    "Status",
+    "Mẫu số",
+    "Ký hiệu",
+    "Số HĐ",
+    "Ngày",
+    "Người bán",
+    "MST người bán",
+    "Địa chỉ người bán",
+    "Người mua (đơn vị)",
+    "MST người mua",
+    "Hình thức TT",
+    "Tiền hàng",
+    "Thuế suất",
+    "Tiền thuế",
+    "Tổng tiền",
+    "Trạng thái",
+    "Ghi chú / Note",
 ]
 LINE_COLUMNS = [
     "File",
-    "Invoice number",
-    "Line",
-    "Description",
-    "Qty",
-    "Unit price (VND)",
-    "Amount (VND)",
+    "Số HĐ",
+    "STT",
+    "Tên hàng hóa",
+    "ĐVT",
+    "Số lượng",
+    "Đơn giá",
+    "Thành tiền",
 ]
-ISSUE_COLUMNS = ["File", "Invoice number", "Issue"]
+ISSUE_COLUMNS = ["File", "Số HĐ", "Lỗi (VI)", "Issue (EN)"]
+
+STATUS_OK = "OK"
+STATUS_ERROR = "LỖI / ERROR"
 
 MONEY_COLUMNS = {
-    "Subtotal (VND)",
-    "VAT amount (VND)",
-    "Total (VND)",
-    "Unit price (VND)",
-    "Amount (VND)",
+    "Tiền hàng",
+    "Tiền thuế",
+    "Tổng tiền",
+    "Đơn giá",
+    "Thành tiền",
+}
+TEXT_COLUMNS = {
+    "Mẫu số",
+    "Ký hiệu",
+    "Số HĐ",
+    "MST người bán",
+    "MST người mua",
 }
 
 HEADER_FILL = PatternFill(start_color="1B3A4B", end_color="1B3A4B", fill_type="solid")
@@ -88,17 +105,18 @@ def build_parser():
 
 def main(argv=None):
     """Read every PDF in the folder, validate it, and write the workbook."""
+    configure_stdout()
     args = build_parser().parse_args(argv)
     input_dir = Path(args.input_dir)
     output_path = Path(args.output)
 
     if not input_dir.is_dir():
-        print(f"Input folder not found: {input_dir}")
+        print(f"Không thấy thư mục: {input_dir} / Input folder not found: {input_dir}")
         return 1
 
     pdf_paths = sorted(input_dir.glob("*.pdf"))
     if not pdf_paths:
-        print(f"No PDF files in {input_dir}")
+        print(f"Không có file PDF trong {input_dir} / No PDF files in {input_dir}")
         return 1
 
     invoice_rows = []
@@ -107,8 +125,8 @@ def main(argv=None):
 
     for pdf_path in pdf_paths:
         invoice, issues = read_one(pdf_path)
-        status = "OK" if not issues else "ERROR"
-        invoice_rows.append(invoice_row(invoice, status))
+        status = STATUS_OK if not issues else STATUS_ERROR
+        invoice_rows.append(invoice_row(invoice, status, issues))
         line_rows.extend(line_item_rows(invoice))
         issue_rows.extend(issue_row(invoice, issue) for issue in issues)
         print_result(pdf_path.name, status, issues)
@@ -116,14 +134,29 @@ def main(argv=None):
     try:
         write_workbook(invoice_rows, line_rows, issue_rows, output_path)
     except PermissionError:
-        print(f"Could not write {output_path}. Close the file if it is open in Excel.")
+        print(
+            f"Không ghi được {output_path}. Hãy đóng file nếu đang mở trong Excel. / "
+            f"Could not write {output_path}. Close the file if it is open in Excel."
+        )
         return 1
 
-    ok_count = sum(1 for row in invoice_rows if row["Status"] == "OK")
+    ok_count = sum(1 for row in invoice_rows if row["Trạng thái"] == STATUS_OK)
     error_count = len(invoice_rows) - ok_count
-    print(f"Processed {len(invoice_rows)} invoices: {ok_count} OK, {error_count} ERROR")
-    print(f"Wrote {output_path}")
+    print(
+        f"Đã xử lý {len(invoice_rows)} hoá đơn: {ok_count} OK, {error_count} lỗi / "
+        f"Processed {len(invoice_rows)} invoices: {ok_count} OK, {error_count} ERROR"
+    )
+    print(f"Đã ghi {output_path} / Wrote {output_path}")
     return 0
+
+
+def configure_stdout():
+    """Let the console print Vietnamese. The default Windows code page cannot."""
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8")
+        except (OSError, ValueError):
+            pass
 
 
 def read_one(pdf_path):
@@ -131,39 +164,40 @@ def read_one(pdf_path):
     try:
         invoice = extract_invoice(pdf_path)
     except Exception as exc:  # a bad PDF should not stop the rest of the folder
-        invoice = {
-            "file_name": pdf_path.name,
-            "invoice_number": None,
-            "issue_date": None,
-            "seller_name": None,
-            "tax_code": None,
-            "buyer_name": None,
-            "subtotal": None,
-            "vat_rate": None,
-            "vat_amount": None,
-            "total": None,
-            "line_items": [],
-        }
-        return invoice, [f"Could not read PDF: {exc}"]
+        invoice = {"file_name": pdf_path.name, "line_items": []}
+        return invoice, [{"vi": f"Không đọc được PDF: {exc}", "en": f"Could not read PDF: {exc}"}]
 
     return invoice, validate_invoice(invoice)
 
 
-def invoice_row(invoice, status):
-    """One Invoices-sheet row."""
+def invoice_row(invoice, status, issues):
+    """One Invoices-sheet row. The note is the Vietnamese summary, blank when OK."""
     return {
         "File": invoice.get("file_name"),
-        "Invoice number": invoice.get("invoice_number"),
-        "Issue date": parse_issue_date(invoice.get("issue_date")),
-        "Seller": invoice.get("seller_name"),
-        "Tax code": empty_as_none(invoice.get("tax_code")),
-        "Buyer": invoice.get("buyer_name"),
-        "Subtotal (VND)": invoice.get("subtotal"),
-        "VAT rate": invoice.get("vat_rate"),
-        "VAT amount (VND)": invoice.get("vat_amount"),
-        "Total (VND)": invoice.get("total"),
-        "Status": status,
+        "Mẫu số": empty_as_none(invoice.get("form_number")),
+        "Ký hiệu": empty_as_none(invoice.get("serial")),
+        "Số HĐ": empty_as_none(invoice.get("invoice_number")),
+        "Ngày": parse_issue_date(invoice.get("issue_date")),
+        "Người bán": invoice.get("seller_name"),
+        "MST người bán": empty_as_none(invoice.get("seller_tax_code")),
+        "Địa chỉ người bán": invoice.get("seller_address"),
+        "Người mua (đơn vị)": invoice.get("buyer_unit"),
+        "MST người mua": empty_as_none(invoice.get("buyer_tax_code")),
+        "Hình thức TT": invoice.get("payment_method"),
+        "Tiền hàng": invoice.get("subtotal"),
+        "Thuế suất": invoice.get("vat_rate"),
+        "Tiền thuế": invoice.get("vat_amount"),
+        "Tổng tiền": invoice.get("total"),
+        "Trạng thái": status,
+        "Ghi chú / Note": note_text(issues),
     }
+
+
+def note_text(issues):
+    """Join the Vietnamese messages for the Ghi chú / Note column."""
+    if not issues:
+        return None
+    return "; ".join(item["vi"] for item in issues)
 
 
 def line_item_rows(invoice):
@@ -173,23 +207,25 @@ def line_item_rows(invoice):
         rows.append(
             {
                 "File": invoice.get("file_name"),
-                "Invoice number": invoice.get("invoice_number"),
-                "Line": index,
-                "Description": item.get("description"),
-                "Qty": item.get("qty"),
-                "Unit price (VND)": item.get("unit_price"),
-                "Amount (VND)": item.get("amount"),
+                "Số HĐ": empty_as_none(invoice.get("invoice_number")),
+                "STT": item.get("line_no") or index,
+                "Tên hàng hóa": item.get("description"),
+                "ĐVT": item.get("unit"),
+                "Số lượng": item.get("qty"),
+                "Đơn giá": item.get("unit_price"),
+                "Thành tiền": item.get("amount"),
             }
         )
     return rows
 
 
 def issue_row(invoice, issue):
-    """One Issues-sheet row."""
+    """One Issues-sheet row, with the Vietnamese and English wording side by side."""
     return {
         "File": invoice.get("file_name"),
-        "Invoice number": invoice.get("invoice_number"),
-        "Issue": issue,
+        "Số HĐ": empty_as_none(invoice.get("invoice_number")),
+        "Lỗi (VI)": issue["vi"],
+        "Issue (EN)": issue["en"],
     }
 
 
@@ -221,11 +257,12 @@ def write_workbook(invoice_rows, line_rows, issue_rows, output_path):
         "Line Items": pd.DataFrame(line_rows, columns=LINE_COLUMNS),
         "Issues": pd.DataFrame(issue_rows, columns=ISSUE_COLUMNS),
     }
-    # Tax codes are text. A numeric column would drop the leading zero.
-    frames["Invoices"]["Tax code"] = frames["Invoices"]["Tax code"].astype("string")
-    frames["Invoices"]["Invoice number"] = frames["Invoices"]["Invoice number"].astype("string")
-    frames["Line Items"]["Invoice number"] = frames["Line Items"]["Invoice number"].astype("string")
-    frames["Issues"]["Invoice number"] = frames["Issues"]["Invoice number"].astype("string")
+    # Tax codes and invoice numbers are text, so a leading zero is kept.
+    for column in TEXT_COLUMNS:
+        if column in frames["Invoices"].columns:
+            frames["Invoices"][column] = frames["Invoices"][column].astype("string")
+    frames["Line Items"]["Số HĐ"] = frames["Line Items"]["Số HĐ"].astype("string")
+    frames["Issues"]["Số HĐ"] = frames["Issues"]["Số HĐ"].astype("string")
 
     with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
         for sheet_name, frame in frames.items():
@@ -273,24 +310,24 @@ def style_sheet(sheet):
 
 def column_alignment(header):
     """Right-align numbers, center short codes, left-align text."""
-    if header in MONEY_COLUMNS or header in ("Qty", "Line", "VAT rate"):
+    if header in MONEY_COLUMNS or header in ("Số lượng", "STT", "Thuế suất"):
         return "right"
-    if header in ("Status", "Issue date"):
+    if header in ("Trạng thái", "Ngày", "Ký hiệu", "Hình thức TT"):
         return "center"
     return "left"
 
 
 def apply_number_format(cell, header):
     """VND amounts use #,##0. Dates and the VAT rate get their own formats."""
-    if header == "Tax code":
+    if header in TEXT_COLUMNS or header == "Số HĐ":
         cell.number_format = "@"
     if cell.value is None:
         return
-    if header in MONEY_COLUMNS or header == "Qty":
+    if header in MONEY_COLUMNS or header == "Số lượng":
         cell.number_format = "#,##0"
-    elif header == "VAT rate":
+    elif header == "Thuế suất":
         cell.number_format = '0"%"'
-    elif header == "Issue date":
+    elif header == "Ngày":
         cell.number_format = "DD/MM/YYYY"
 
 
@@ -298,12 +335,12 @@ def highlight_error_rows(sheet):
     """Fill every cell in an ERROR invoice row."""
     headers = [cell.value for cell in sheet[1]]
     try:
-        status_index = headers.index("Status")
+        status_index = headers.index("Trạng thái")
     except ValueError:
         return
 
     for row in sheet.iter_rows(min_row=2, max_row=sheet.max_row, max_col=sheet.max_column):
-        if row[status_index].value != "ERROR":
+        if row[status_index].value != STATUS_ERROR:
             continue
         for cell in row:
             cell.fill = ERROR_FILL
@@ -312,7 +349,15 @@ def highlight_error_rows(sheet):
 
 def autosize_columns(sheet, headers):
     """Set each column just wide enough for its contents, with a sensible cap."""
-    caps = {"Issue": 78, "Description": 42, "Seller": 46, "Buyer": 46}
+    caps = {
+        "Lỗi (VI)": 88,
+        "Issue (EN)": 84,
+        "Ghi chú / Note": 88,
+        "Tên hàng hóa": 36,
+        "Người bán": 46,
+        "Người mua (đơn vị)": 42,
+        "Địa chỉ người bán": 56,
+    }
     for index, header in enumerate(headers, start=1):
         letter = get_column_letter(index)
         longest = len(str(header))
@@ -330,16 +375,16 @@ def display_length(value, header):
     """Length used for column width. Dates are measured as DD/MM/YYYY, not as timestamps."""
     if value is None:
         return 0
-    if header == "Issue date" and hasattr(value, "strftime"):
+    if header == "Ngày" and hasattr(value, "strftime"):
         return len(value.strftime("%d/%m/%Y"))
     return len(str(value))
 
 
 def print_result(file_name, status, issues):
-    """Print one line per invoice, plus the problems under ERROR rows."""
+    """Print one line per invoice, plus the problems in Vietnamese and English."""
     print(f"{file_name:<24} {status}")
-    for issue in issues:
-        print(f"  - {issue}")
+    for item in issues:
+        print(f"  - {item['vi']} / {item['en']}")
 
 
 if __name__ == "__main__":
